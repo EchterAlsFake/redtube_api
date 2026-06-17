@@ -17,18 +17,19 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import os
 import re
+import json
+from gettext import find
+
 import chompjs
 import logging
 import asyncio
 
-from bs4 import BeautifulSoup
 from curl_cffi import Response, AsyncSession
 from functools import cached_property
 from typing import Any, List, Dict, AsyncGenerator
 from base_api.modules.type_hints import DownloadReport
 from base_api.base import BaseCore, setup_logger, Helper
-from base_api.modules.errors import InvalidProxy, UnknownError, NetworkingError, BotProtectionDetected
-
+from base_api.modules.errors import InvalidProxy, UnknownError, NetworkingError, BotProtectionDetected, ResourceGone
 try:
     import lxml
     parser = "lxml" # Faster speeds, but more dependencies
@@ -47,13 +48,21 @@ except (ModuleNotFoundError, ImportError):
     from .modules.type_hints import *
 
 
+async def on_error(url: str, error: Exception, attempt: int) -> bool:
+    print(f"URL: {url}, ERROR: {error}, Attempt: {attempt}")
+
+    if isinstance(error, ResourceGone):
+        return False
+
+    return True
+
+
 async def get_html_content(core: BaseCore, url: str) -> str | None | dict:
     try:
         content = await core.fetch(url)
         if isinstance(content, str):
             return content
 
-        print(f"Not a stirng!")
         if isinstance(content, Response):
             if content.status_code == 404:
                 raise NotFound(f"Server returned 404 for: {url}")
@@ -212,13 +221,56 @@ class Video:
         """Returns the raw list of dictionaries containing video streams (HLS, MP4)."""
         return self.script.get('mainRoll', {}).get('mediaDefinition', [])
 
-    @cached_property
-    def m3u8_base_url(self) -> str | None:
+    async def m3u8_base_url(self) -> str | None:
         """Convenience property to quickly get the main HLS adaptive stream path."""
+        url = None
         for media in self.media_definitions:
             if media.get('format') == 'hls':
-                return "https://redtube.com" + str(media.get('videoUrl'))
-        return None
+                url = "https://redtube.com" + str(media.get('videoUrl'))
+
+
+        stuff = await get_html_content(core=self.core, url=url)
+        assert isinstance(stuff, str)
+        data = json.loads(stuff)
+
+        m3u8_lines = ["#EXTM3U", "#EXT-X-VERSION:3"]
+
+        for stream in data:
+            quality = stream.get("quality", "unknown")
+            width = stream.get("width", 720)
+            height = stream.get("height", 404)
+            url = stream.get("videoUrl", "")
+
+            if not url:
+                continue
+
+            # Rough bandwidth estimation based on standard stream naming conventions
+            # (e.g., 4000K = 4,000,000 bps, 2000K = 2,000,000 bps)
+            # If '1080P_4000K' is in the URL, we use 4000000. Default to a sensible fallback.
+            bandwidth = 4000000
+            if "4000K" in url:
+                bandwidth = 4000000
+            elif "2000K" in url:
+                bandwidth = 2000000
+            elif "1000K" in url:
+                bandwidth = 1000000
+
+            # Adjust dimensions safely if height changes per quality
+            # Your JSON snippet showed height 404 for all, but typically:
+            stream_height = int(quality) if quality.isdigit() else height
+            # Rough 16:9 aspect ratio calculation for width if it's dynamic
+            stream_width = int(stream_height * (16 / 9)) if quality.isdigit() else width
+
+            # Append the stream info tag with attributes
+            m3u8_lines.append(
+                f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},'
+                f'RESOLUTION={stream_width}x{stream_height},'
+                f'NAME="{quality}p"'
+            )
+            # The line immediately following the tag must be the URI
+            m3u8_lines.append(url)
+
+        return "\n".join(m3u8_lines)
 
     @cached_property
     def mp4_url(self) -> str | None:
@@ -297,6 +349,87 @@ class Video:
                                          segment_state_path=segment_state_path, segment_dir=segment_dir,
                                          return_report=return_report,
                                          cleanup_on_stop=cleanup_on_stop, keep_segment_dir=keep_segment_dir)
+
+
+class Playlist(Helper):
+    def __init__(self, url: str, core: BaseCore):
+        super().__init__(core=core, video_constructor=Video)
+        self.core = core
+        self.url = url
+        self._soup = None
+        self.html_content = None
+        self.logger = setup_logger(name="RedTube API - [Playlist]", log_file=None, level=logging.ERROR)
+
+    def enable_logging(self, log_file: str | None = None, level: int | None =None, log_ip: str | None = None, log_port: int | None = None):
+        if not level:
+            level = logging.DEBUG
+
+        self.logger = setup_logger(name="RedTube API - [Playlist]", log_file=log_file, level=level, http_ip=log_ip,
+                                   http_port=log_port)
+
+    @property
+    def soup(self) -> BeautifulSoup:
+        if not self._soup:
+            raise ValueError("You probably forgot to call init")
+
+        return self._soup
+
+    async def init(self):
+        self.html_content = await get_html_content(core=self.core, url=self.url)
+
+        assert isinstance(self.html_content, str)
+        self._soup = BeautifulSoup(self.html_content, parser)
+        return self
+
+    @cached_property
+    def title(self) -> str:
+        return self.soup.find("h1", attrs={"id": "playlist_title"}).text
+
+    @cached_property
+    def author(self) -> str:
+        return self.soup.find("p", class_="playlist_desc").find("a").text
+
+    @cached_property
+    def tags(self) -> list:
+        tags = []
+
+        _tags = self.soup.find_all("span", class_="playlist_taglist")
+        for tag in _tags:
+            tags.append(tag.find("a").text)
+
+        return tags
+
+    @cached_property
+    def rating_percent(self) -> str:
+        return self.soup.find("div", class_="rating_percent js_rating_percent").text
+
+    @cached_property
+    def rating_count(self) -> str:
+        return self.soup.find("span", class_="playlist_stats_value").text
+
+    @cached_property
+    def viwws(self) -> str:
+        return self.soup.find_all("span", class_="playlist_stats_value")[1].text
+
+    @cached_property
+    def video_count(self) -> str:
+        return self.soup.find_all("span", class_="playlist_stats_value")[2].text
+
+    async def get_videos(self, pages: int = 2,
+                     videos_concurrency: int | None = None,
+                     pages_concurrency: int | None = None,
+                     ) -> AsyncGenerator[Video, None]:
+        # I am too lazy to implement search filters
+
+        page_urls = [f"{self.url}&page={page}" for page in range(1, pages + 1)]
+        videos_concurrency = videos_concurrency or self.core.configuration.videos_concurrency
+        pages_concurrency = pages_concurrency or self.core.configuration.pages_concurrency
+        assert videos_concurrency and pages_concurrency
+
+        async for video in self.iterator(target_page_urls=page_urls, max_video_concurrency=videos_concurrency,
+                                         max_page_concurrency=pages_concurrency, video_link_extractor=extractor_html,
+                                         on_video_error=on_error):
+            yield video
 
 
 class Pornstar(Helper):
@@ -387,11 +520,10 @@ class Pornstar(Helper):
         videos_concurrency = videos_concurrency or self.core.configuration.videos_concurrency
         pages_concurrency = pages_concurrency or self.core.configuration.pages_concurrency
         assert videos_concurrency and pages_concurrency
-
         async for video in self.iterator(target_page_urls=page_urls, max_video_concurrency=videos_concurrency,
-                                         max_page_concurrency=pages_concurrency, video_link_extractor=extractor_html):
-            stuff = await video.init()
-            yield stuff
+                                         max_page_concurrency=pages_concurrency, video_link_extractor=extractor_html,
+                                         on_video_error=on_error):
+            yield video
 
 
 class Client(Helper):
@@ -421,6 +553,10 @@ class Client(Helper):
         pornstar = Pornstar(core=self.core, url=url)
         return await pornstar.init()
 
+    async def get_playlist(self, url: str) -> Playlist:
+        playlist = Playlist(core=self.core, url=url)
+        return await playlist.init()
+
     async def search(self, query: str, pages: int = 2,
                      videos_concurrency: int | None = None,
                      pages_concurrency: int | None = None,
@@ -433,17 +569,15 @@ class Client(Helper):
         assert videos_concurrency and pages_concurrency
 
         async for video in self.iterator(target_page_urls=page_urls, max_video_concurrency=videos_concurrency,
-                                         max_page_concurrency=pages_concurrency, video_link_extractor=extractor_html):
-            stuff = await video.init()
-            yield stuff
-
-
+                                         max_page_concurrency=pages_concurrency, video_link_extractor=extractor_playlist,
+                                         on_video_error=on_error):
+            yield video
 
 
 async def main():
     client = Client()
-    pornstar = await client.get_pornstar("https://de.redtube.com/pornstar/ryan+mclane")
-    async for video in pornstar.get_videos():
+    playlist = await client.get_playlist("https://de.redtube.com/playlist/273511")
+    async for video in playlist.get_videos():
         print(video.title)
 
 asyncio.run(main())
